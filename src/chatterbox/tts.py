@@ -23,8 +23,8 @@ REPO_ID = "ResembleAI/chatterbox"
 
 def punc_norm(text: str) -> str:
     """
-        Quick cleanup func for punctuation from LLMs or
-        containing chars not seen often in the dataset
+    Quick cleanup func for punctuation from LLMs or
+    containing chars not seen often in the dataset
     """
     if len(text) == 0:
         return "You need to add some text for me to talk."
@@ -46,8 +46,8 @@ def punc_norm(text: str) -> str:
         ("—", "-"),
         ("–", "-"),
         (" ,", ","),
-        ("“", "\""),
-        ("”", "\""),
+        ("“", '"'),
+        ("”", '"'),
         ("‘", "'"),
         ("’", "'"),
     ]
@@ -80,6 +80,7 @@ class Conditionals:
         - prompt_feat_len
         - embedding
     """
+
     t3: T3Cond
     gen: dict
 
@@ -91,10 +92,7 @@ class Conditionals:
         return self
 
     def save(self, fpath: Path):
-        arg_dict = dict(
-            t3=self.t3.__dict__,
-            gen=self.gen
-        )
+        arg_dict = dict(t3=self.t3.__dict__, gen=self.gen)
         torch.save(arg_dict, fpath)
 
     @classmethod
@@ -102,12 +100,13 @@ class Conditionals:
         if isinstance(map_location, str):
             map_location = torch.device(map_location)
         kwargs = torch.load(fpath, map_location=map_location, weights_only=True)
-        return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
+        return cls(T3Cond(**kwargs["t3"]), kwargs["gen"])
 
 
 @dataclass
 class StreamingMetrics:
     """Metrics for streaming TTS generation"""
+
     latency_to_first_chunk: Optional[float] = None
     rtf: Optional[float] = None
     total_generation_time: Optional[float] = None
@@ -136,21 +135,21 @@ class ChatterboxTTS:
         self.device = device
         self.conds = conds
         self.watermarker = perth.PerthImplicitWatermarker()
+        self._warmed = False
+        self._hift_cache = None
 
     @classmethod
-    def from_local(cls, ckpt_dir, device) -> 'ChatterboxTTS':
+    def from_local(cls, ckpt_dir, device) -> "ChatterboxTTS":
         ckpt_dir = Path(ckpt_dir)
 
         # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
         if device in ["cpu", "mps"]:
-            map_location = torch.device('cpu')
+            map_location = torch.device("cpu")
         else:
             map_location = None
 
         ve = VoiceEncoder()
-        ve.load_state_dict(
-            torch.load(ckpt_dir / "ve.pt", map_location=map_location)
-        )
+        ve.load_state_dict(torch.load(ckpt_dir / "ve.pt", map_location=map_location))
         ve.to(device).eval()
 
         t3 = T3()
@@ -161,14 +160,10 @@ class ChatterboxTTS:
         t3.to(device).eval()
 
         s3gen = S3Gen()
-        s3gen.load_state_dict(
-            torch.load(ckpt_dir / "s3gen.pt", map_location=map_location)
-        )
+        s3gen.load_state_dict(torch.load(ckpt_dir / "s3gen.pt", map_location=map_location))
         s3gen.to(device).eval()
 
-        tokenizer = EnTokenizer(
-            str(ckpt_dir / "tokenizer.json")
-        )
+        tokenizer = EnTokenizer(str(ckpt_dir / "tokenizer.json"))
 
         conds = None
         if (builtin_voice := ckpt_dir / "conds.pt").exists():
@@ -177,19 +172,100 @@ class ChatterboxTTS:
         return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
 
     @classmethod
-    def from_pretrained(cls, device) -> 'ChatterboxTTS':
+    def from_pretrained(cls, device, warmup: bool = True) -> "ChatterboxTTS":
         # Check if MPS is available on macOS
         if device == "mps" and not torch.backends.mps.is_available():
             if not torch.backends.mps.is_built():
                 print("MPS not available because the current PyTorch install was not built with MPS enabled.")
             else:
-                print("MPS not available because the current MacOS version is not 12.3+ and/or you do not have an MPS-enabled device on this machine.")
+                print(
+                    "MPS not available because the current MacOS version is not 12.3+ and/or you do not have an MPS-enabled device on this machine."
+                )
             device = "cpu"
-        
+
         for fpath in ["ve.pt", "t3_cfg.pt", "s3gen.pt", "tokenizer.json", "conds.pt"]:
             local_path = hf_hub_download(repo_id=REPO_ID, filename=fpath)
 
-        return cls.from_local(Path(local_path).parent, device)
+        instance = cls.from_local(Path(local_path).parent, device)
+        if warmup:
+            try:
+                instance.warmup()
+            except Exception as e:
+                # don't hard-fail on warmup errors — print for visibility
+                print(f"Model warmup failed (continuing): {e}")
+        return instance
+
+    def warmup(self, *, text: str = "Hello.", max_new_tokens: int = 8, chunk_size: int = 4, print_progress: bool = True):
+        """
+        Run a short forward pass to "warm" compiled kernels, caches and allocate memory on the device.
+        Requires conditionals (self.conds) because the S3Gen pipeline needs a ref_dict.
+        - text: small text to tokenize for a short T3 inference pass
+        - max_new_tokens: how many tokens to step to trigger compilation
+        - chunk_size: chunk size used for inference_stream
+        """
+        if self._warmed:
+            if print_progress:
+                print("Model already warmed — skipping warmup.")
+            return
+
+        if self.conds is None:
+            # Warmup depends on conditionals (ref dict) to run a representative S3Gen pass.
+            print(
+                "No conditionals present (self.conds is None). Skipping warmup. "
+                "Call prepare_conditionals(...) or pass audio_prompt_path to generate to enable warmup."
+            )
+            return
+
+        if print_progress:
+            print(f"Warming up models on device={self.device} — this will run a tiny forward pass...")
+
+        start_time = time.time()
+        with torch.inference_mode():
+            # Build a pair of text tokens for CFG path similar to generate/generate_stream
+            text = punc_norm(text)
+            text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # CFG double-batch
+            sot = self.t3.hp.start_text_token
+            eot = self.t3.hp.stop_text_token
+            text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+            text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+
+            # Use inference_stream to trigger compilation of patched_model and an initial generation step.
+            # We only consume the first yielded token chunk, then pass it through _process_token_buffer to warm S3Gen.
+            try:
+                gen = self.inference_stream(
+                    t3_cond=self.conds.t3,
+                    text_tokens=text_tokens,
+                    max_new_tokens=max_new_tokens,
+                    temperature=1.0,
+                    cfg_weight=0.0,
+                    chunk_size=chunk_size,
+                )
+
+                # get the first token chunk (or until EOS) and run S3Gen inference on it
+                for token_chunk in gen:
+                    # Each yielded chunk is a tensor (batch, tokens). We extract the conditional batch.
+                    token_chunk = token_chunk[0]  # conditional batch
+                    # call internal processor: pass minimal args to force S3Gen forward pass
+                    metrics = StreamingMetrics()
+                    audio_tensor, audio_duration, success = self._process_token_buffer(
+                        [token_chunk],
+                        all_tokens_so_far=[],
+                        context_window=0,
+                        start_time=start_time,
+                        metrics=metrics,
+                        print_metrics=False,
+                        fade_duration=0.0,
+                    )
+                    # We don't use the output, just force the forward call
+                    break
+            except Exception as e:
+                # If anything goes wrong, don't fail hard; report and continue.
+                print(f"Warmup encountered an error (non-fatal): {e}")
+
+        self._warmed = True
+        if print_progress:
+            print(f"Warmup complete (took {time.time() - start_time:.3f}s).")
 
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
         ## Load reference wav
@@ -197,13 +273,13 @@ class ChatterboxTTS:
 
         ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
 
-        s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
+        s3gen_ref_wav = s3gen_ref_wav[: self.DEC_COND_LEN]
         s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
 
         # Speech cond prompt tokens
         if plen := self.t3.hp.speech_cond_prompt_len:
             s3_tokzr = self.s3gen.tokenizer
-            t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[:self.ENC_COND_LEN]], max_len=plen)
+            t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[: self.ENC_COND_LEN]], max_len=plen)
             t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
 
         # Voice-encoder speaker embedding
@@ -291,7 +367,7 @@ class ChatterboxTTS:
 
         # Validate inputs
         text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=self.device)
-        
+
         # Default initial speech to a single start-of-speech token
         initial_speech_tokens = self.t3.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
 
@@ -306,7 +382,7 @@ class ChatterboxTTS:
         if not self.t3.compiled:
             from .models.t3.inference.alignment_stream_analyzer import AlignmentStreamAnalyzer
             from .models.t3.inference.t3_hf_backend import T3HuggingfaceBackend
-            
+
             alignment_stream_analyzer = AlignmentStreamAnalyzer(
                 self.t3.tfmr,
                 None,
@@ -419,18 +495,15 @@ class ChatterboxTTS:
         start_time,
         metrics,
         print_metrics,
-        fade_duration=0.02  # seconds to apply linear fade-in on each chunk
+        fade_duration=0.02,  # seconds to apply linear fade-in on each chunk
+        cache_hot_path=True,
     ):
         # Combine buffered chunks of tokens
         new_tokens = torch.cat(token_buffer, dim=-1)
 
         # Build tokens_to_process by including a context window
         if len(all_tokens_so_far) > 0:
-            context_tokens = (
-                all_tokens_so_far[-context_window:]
-                if len(all_tokens_so_far) > context_window
-                else all_tokens_so_far
-            )
+            context_tokens = all_tokens_so_far[-context_window:] if len(all_tokens_so_far) > context_window else all_tokens_so_far
             tokens_to_process = torch.cat([context_tokens, new_tokens], dim=-1)
             context_length = len(context_tokens)
         else:
@@ -443,10 +516,14 @@ class ChatterboxTTS:
             return None, 0.0, False
 
         # Run S3Gen inference to get a waveform (1 × T)
-        wav, _ = self.s3gen.inference(
-            speech_tokens=clean_tokens,
-            ref_dict=self.conds.gen,
-        )
+        if cache_hot_path:
+            mels = self.s3gen.flow_inference(speech_tokens=clean_tokens, ref_dict=self.conds.gen, finalize=False)
+            wav, new_cache = self.s3gen.hift_inference(speech_feat=mels, cache_source=self._hift_cache)
+            self._hift_cache = new_cache
+        else:
+            mels_final = self.s3gen.flow_inference(speech_tokens=clean_tokens, ref_dict=self.conds.gen, finalize=True)
+            wav, _ = self.s3gen.hift_inference(speech_feat=mels_final, cache_source=self._hift_cache)
+
         wav = wav.squeeze(0).detach().cpu().numpy()
 
         # If we have context tokens, crop out the samples corresponding to them
@@ -482,8 +559,6 @@ class ChatterboxTTS:
         metrics.chunk_count += 1
         return audio_tensor, audio_duration, True
 
-
-
     def generate_stream(
         self,
         text: str,
@@ -492,13 +567,13 @@ class ChatterboxTTS:
         cfg_weight: float = 0.5,
         temperature: float = 0.8,
         chunk_size: int = 25,  # Tokens per chunk
-        context_window = 50,
+        context_window=50,
         fade_duration=0.02,  # seconds to apply linear fade-in on each chunk
         print_metrics: bool = True,
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
         Streaming version of generate that yields audio chunks as they are generated.
-        
+
         Args:
             text: Input text to synthesize
             audio_prompt_path: Optional path to reference audio for voice cloning
@@ -509,14 +584,14 @@ class ChatterboxTTS:
             context_window: The context passed for each chunk
             fade_duration: Seconds to apply linear fade-in on each chunk
             print_metrics: Whether to print RTF and latency metrics
-            
+
         Yields:
             Tuple of (audio_chunk, metrics) where audio_chunk is a torch.Tensor
             and metrics contains timing information
         """
         start_time = time.time()
         metrics = StreamingMetrics()
-        
+
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:
@@ -543,8 +618,10 @@ class ChatterboxTTS:
 
         total_audio_length = 0.0
         all_tokens_processed = []  # Keep track of all tokens processed so far
-        
+
         with torch.inference_mode():
+            self._hift_cache = torch.zeros(1, 1, 0, device=self.device)
+
             # Stream speech tokens
             for token_chunk in self.inference_stream(
                 t3_cond=self.conds.t3,
@@ -556,22 +633,45 @@ class ChatterboxTTS:
             ):
                 # Extract only the conditional batch
                 token_chunk = token_chunk[0]
-                
+
                 # Process each chunk immediately
                 audio_tensor, audio_duration, success = self._process_token_buffer(
-                    [token_chunk], all_tokens_processed, context_window, 
-                    start_time, metrics, print_metrics, fade_duration
+                    [token_chunk],
+                    all_tokens_processed,
+                    context_window,
+                    start_time,
+                    metrics,
+                    print_metrics,
+                    fade_duration,
                 )
-                
+
                 if success:
                     total_audio_length += audio_duration
                     yield audio_tensor, metrics
-                
+
                 # Update all_tokens_processed with the new tokens
                 if len(all_tokens_processed) == 0:
                     all_tokens_processed = token_chunk
                 else:
                     all_tokens_processed = torch.cat([all_tokens_processed, token_chunk], dim=-1)
+
+            if self._hift_cache is not None and len(all_tokens_processed) > 0:
+                audio_tensor, audio_duration, success = self._process_token_buffer(
+                    [token_chunk],
+                    all_tokens_processed,
+                    context_window,
+                    start_time,
+                    metrics,
+                    print_metrics,
+                    fade_duration,
+                    cache_hot_path=False,
+                )
+
+                if success:
+                    total_audio_length += audio_duration
+                    yield audio_tensor, metrics
+                else:
+                    print("Error on last tokens")
 
         # Final metrics calculation
         metrics.total_generation_time = time.time() - start_time
